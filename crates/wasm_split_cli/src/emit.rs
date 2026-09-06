@@ -917,8 +917,13 @@ impl<'a> ModuleEmitState<'a> {
         self.output_module_index == 0
     }
 
-    fn get_relocated_data(&self, range: Range<InputOffset>) -> Result<Vec<u8>> {
-        RelocInfo::get_relocated_data(self.input_module, range, self)
+    /// See [`RelocInfo::get_relocated_data`].
+    fn get_relocated_data(
+        &self,
+        range: Range<InputOffset>,
+        output_address: Option<u64>,
+    ) -> Result<Vec<u8>> {
+        RelocInfo::get_relocated_data(self.input_module, range, self, output_address)
     }
 
     fn generate(&mut self) -> Result<()> {
@@ -1260,7 +1265,7 @@ impl<'a> ModuleEmitState<'a> {
                     let input_func = &self.input_module.defined_funcs
                         [input_func_id - self.input_module.imported_funcs.len()];
                     let relocated_def = self
-                        .get_relocated_data(input_func.body.range())
+                        .get_relocated_data(input_func.body.range(), None)
                         .with_context(|| {
                             format!(
                                 "when emitted definition of func[{}] in module {}",
@@ -1320,11 +1325,22 @@ impl<'a> ModuleEmitState<'a> {
         Ok(())
     }
 
+    /// The relocated bytes of a whole segment, which is emitted where the input placed it.
     fn get_relocated_segment_data(&self, data: &Data<'_>) -> Result<Vec<u8>> {
         // Note: `data.range` includes the segment header.
         let range_end = data.range.end;
         let range_start = wasm_data_start(data);
-        self.get_relocated_data(range_start..range_end)
+        let address = match &data.kind {
+            DataKind::Passive => None,
+            DataKind::Active { offset_expr, .. } => {
+                match offset_expr.get_operators_reader().read()? {
+                    Operator::I32Const { value } => Some(value as u32 as u64),
+                    Operator::I64Const { value } => Some(value as u64),
+                    _ => None,
+                }
+            }
+        };
+        self.get_relocated_data(range_start..range_end, address)
     }
 
     fn generate_data_section(&mut self) -> Result<()> {
@@ -1358,11 +1374,13 @@ impl<'a> ModuleEmitState<'a> {
                     base_address,
                     ..
                 } => {
-                    if let Some(module_offset) = per_output_offset.get(&self.output_module_index) {
-                        addr_offset = Some(base_address + *module_offset);
-                    } else {
-                        addr_offset = None;
-                    }
+                    let module_offset = per_output_offset
+                        .get(&self.output_module_index)
+                        .copied()
+                        .unwrap_or_default();
+                    addr_offset = per_output_offset
+                        .contains_key(&self.output_module_index)
+                        .then_some(base_address + module_offset);
                     data = vec![];
                     for &range_idx in range_emit_order {
                         let range = &ranges[range_idx];
@@ -1373,7 +1391,8 @@ impl<'a> ModuleEmitState<'a> {
                         let input_range = (input_range_start + data_range.start)
                             ..(input_range_start + data_range.end);
                         data.resize(range.in_module_offset as usize, 0); // pad with zeroes
-                        data.extend(self.get_relocated_data(input_range)?);
+                        let address = base_address + module_offset + range.in_module_offset;
+                        data.extend(self.get_relocated_data(input_range, Some(address))?);
                     }
                 }
             }

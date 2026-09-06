@@ -1,5 +1,8 @@
 ## wasm_split_cli vfuture
 
+- Fix `R_WASM_MEMORY_ADDR_LOCREL_I32` relocations (pointers relative to their own location)
+  being written as absolute addresses, and not being updated at all when only the pointer
+  moved. Like `wasm-ld`, the low 32 bits of the difference are encoded.
 - Experimental support to emit debug sections. By default enabled via environment variable
   `WASM_SPLIT_CLI_ENABLE_DWARF`. The current setup duplicates the DWARF information into
   all output modules, which can lead to large split files.

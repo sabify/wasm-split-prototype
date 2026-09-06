@@ -117,6 +117,20 @@ impl<'a> RelocInfoParser<'a> {
     pub fn finish(self, module: &InputModule<'a>) -> Result<RelocInfo<'a>> {
         let mut info = self.info;
         info.data_symbols = get_data_symbols(&module.data_segments, &info.symbols)?;
+        info.segment_addresses = module
+            .data_segments
+            .iter()
+            .map(|segment| match &segment.kind {
+                wasmparser::DataKind::Active { offset_expr, .. } => {
+                    match offset_expr.get_operators_reader().read().ok()? {
+                        wasmparser::Operator::I32Const { value } => Some(value as u32 as u64),
+                        wasmparser::Operator::I64Const { value } => Some(value as u64),
+                        _ => None,
+                    }
+                }
+                wasmparser::DataKind::Passive => None,
+            })
+            .collect();
         if !self.has_linking_section {
             bail!("No linking section found. Make sure that your program is compiled with `-Clink-args=--emit-relocs`.");
         }
@@ -328,6 +342,8 @@ fn reconstruct_global_symbols(reloc_info: &mut RelocInfo<'_>, module: &InputModu
 
 #[derive(Default)]
 pub struct RelocInfo<'a> {
+    // the address of every input data segment, if it is active with a constant offset
+    segment_addresses: Vec<Option<u64>>,
     // The relocatable range within each section. The start offset is the base from which
     // the relocation entry is offset from.
     pub relocatable_ranges: Vec<Range<InputOffset>>,
@@ -440,17 +456,34 @@ impl RelocInfo<'_> {
         (reloc_base, section_relocs[reloc_range].iter())
     }
 
+    /// Copy the input bytes in `range` and apply the relocations in them.
+    ///
+    /// `output_address` is the address in linear memory that the byte at `range.start` will
+    /// have once the copy is emitted, or `None` if the bytes do not go into memory (code and
+    /// custom sections). It is needed for relocations relative to their own location.
     pub fn get_relocated_data(
         module: &InputModule,
         range: Range<InputOffset>,
         target: &impl RelocTarget,
+        output_address: Option<u64>,
     ) -> Result<Vec<u8>> {
         let this = &module.reloc_info;
         let mut data = Vec::from(&module.raw[range.start as usize..range.end as usize]);
         let (reloc_base, relocs) = this.get_relocations_for_range(&range);
         let reloc_base_to_data_off = range.start - reloc_base;
         for relocation in relocs {
-            this.apply_relocation(target, &mut data, reloc_base_to_data_off, relocation)?;
+            // the address of the bytes being relocated, if they are in memory. Relocation
+            // offsets are relative to the section, `reloc_base_to_data_off` maps them to `data`.
+            let location_address = output_address.map(|address| {
+                address + (wasm_reloc_range(relocation).start - reloc_base_to_data_off)
+            });
+            this.apply_relocation(
+                target,
+                &mut data,
+                reloc_base_to_data_off,
+                relocation,
+                location_address,
+            )?;
         }
         Ok(data)
     }
@@ -599,6 +632,7 @@ impl RelocInfo<'_> {
         data: &mut [u8],
         reloc_base_to_data_off: u64,
         relocation: &RelocationEntry,
+        location_address: Option<u64>,
     ) -> Result<()> {
         // TODO(MSRV): -1i32.cast_unsigned() since rust 1.87
         let relocated = if relocation.index == (-1i32 as u32) {
@@ -623,6 +657,30 @@ impl RelocInfo<'_> {
         let target = &mut data[(relocation_range.start - reloc_base_to_data_off) as usize
             ..(relocation_range.end - reloc_base_to_data_off) as usize];
         let ty = relocation.ty;
+        if ty == RelocationType::MemoryAddrLocrelI32 {
+            // The value is the address of the symbol relative to the address of the relocated
+            // bytes themselves: `S + A - P`, see the wasm linking conventions. Either address
+            // can change when data moves, so this cannot be encoded like an absolute address,
+            // and it must be re-encoded even if the symbol did not move.
+            let Some(location_address) = location_address else {
+                bail!("Found {relocation:?} relative to its location outside of memory data");
+            };
+            let symbol_address = match relocated {
+                Some(SENTINEL_UNDEF) if T::SENTINEL_UNDEF => {
+                    bail!(
+                        "Found {relocation:?} relative to its location against an undefined symbol"
+                    );
+                }
+                Some(address) => address,
+                None => self.original_symbol_address(relocation)?,
+            };
+            // Like `wasm-ld`, encode the low 32 bits of the difference.
+            let relative = (symbol_address as i64)
+                .wrapping_add(relocation.addend)
+                .wrapping_sub(location_address as i64);
+            encode_u32(relative as u32, target.try_into().unwrap());
+            return Ok(());
+        }
         let Some(value) = relocated else {
             return Ok(());
         };
@@ -633,6 +691,24 @@ impl RelocInfo<'_> {
         );
         let () = encode_for_ty(ty, value, relocation.addend, target, T::SENTINEL_UNDEF)?;
         Ok(())
+    }
+
+    /// The address a data symbol has in the input, for symbols that are not relocated.
+    fn original_symbol_address(&self, relocation: &RelocationEntry) -> Result<u64> {
+        let RelocDetails::MemoryAddr(DataDetails {
+            definition: Some(definition),
+            ..
+        }) = self.expand_relocation(relocation)?
+        else {
+            bail!("Found {relocation:?} relative to its location against an undefined symbol");
+        };
+        let Some(segment) = self.segment_addresses.get(definition.index as usize) else {
+            bail!("Invalid data segment index in symbol: {definition:?}");
+        };
+        let Some(segment_address) = segment else {
+            bail!("Found {relocation:?} against a symbol in a data segment without a constant address");
+        };
+        Ok(segment_address + u64::from(definition.offset))
     }
 }
 
@@ -763,8 +839,11 @@ fn encode_for_ty(
         };
     }
     match ty {
+        MemoryAddrLocrelI32 => {
+            unreachable!("relocations relative to their location are encoded by the caller")
+        }
         TableIndexI32 | MemoryAddrI32 | FunctionOffsetI32 | SectionOffsetI32 | GlobalIndexI32
-        | FunctionIndexI32 | MemoryAddrLocrelI32 => {
+        | FunctionIndexI32 => {
             let resolved = try_into_value!(resolved as u32, "invalid value for I32 relocation");
             encode_u32(resolved, target.try_into().unwrap());
             Ok(())
